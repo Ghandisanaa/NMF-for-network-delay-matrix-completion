@@ -1,0 +1,194 @@
+library(igraph)
+library(markovchain)
+library(glmnet)
+library("NMFN") 
+library(data.table)
+
+###### Generating the graph
+
+I <-150       #The number of nodes       
+n_sources<-8  #The numebr of sources
+n_dest<-8     #The numebr of dstinations
+nodes<-1:I
+Horizon<-700   #Represents the limit of the window time
+g <- erdos.renyi.game(I, 1.8/60)
+Source.vec<-sample(nodes,n_sources)
+non.source<-nodes [! nodes %in% Source.vec]
+Destination.vec<-sample(non.source,n_dest)
+A <- as_adjacency_matrix(g)
+Incidence.matrix<-array(0,c(2*length(E(g)),2))
+l=1
+for(i in 1:I){
+  for(j in 1:I){
+    if(A[i,j]==1){
+      Incidence.matrix[l,1]<-i
+      Incidence.matrix[l,2]<-j
+      l=l+1
+    }
+  }
+}
+# The routing matrix using the shortest paths
+R<-array(0,c(length(Source.vec)*length(Destination.vec),2*length(E(g))))
+p<-1
+for(source in Source.vec){
+  z<-get.shortest.paths(g, source)
+  for(destination in Destination.vec){
+    for(l in 1:(length(z$vpath[[destination]])-1)){
+      x<-c()
+      for(l1 in 1:dim(Incidence.matrix)[1]){
+          x<-c(x,(z$vpath[[destination]][l]==Incidence.matrix[l1,1])*
+            (z$vpath[[destination]][(l+1)]==Incidence.matrix[l1,2]))
+      }
+      R[p,c(1:length(x))[x==1]]<-1
+    }
+    p=p+1
+  }
+}
+
+###### Plotting the graph
+
+V(g)$color[Source.vec]="lightblue"
+V(g)$size[Source.vec]=12
+V(g)$color[Destination.vec]="lightgreen"
+V(g)$size[Destination.vec]=12
+V(g)$color[-c(Source.vec,Destination.vec)]="yellow"
+V(g)$size[-c(Source.vec,Destination.vec)]=6
+V(g)$label <- NA
+plot(g,vertex.color=V(g)$color,layout=layout.sphere, main="Simulated network topology",edge.width=0.3 )
+legend(x=-1.5, y=-1.1, c("Sources","Destinations", "Transition routers"), pch=21,
+       col=c("lightblue","lightgreen","yellow"), pt.bg=c("lightblue","lightgreen","yellow"), pt.cex=1.5, cex=.7, bty="n", ncol=1)
+
+
+###### Generating the traffic 
+
+Volume<-function(x)    # x represent time instants
+{  return(100*(2+sin(x/360))+rnorm(1,0,10)) }
+
+###### Generating the traffic load balancing
+
+set.seed(1)
+epsilon<-0.01       #define two markov chains and their transition matrices
+tmS1 <- matrix(c(1-epsilon,epsilon,epsilon,1-epsilon),nrow = 2, byrow = TRUE)
+tmD1 <- matrix(c(1-epsilon,epsilon,epsilon,1-epsilon),nrow = 2, byrow = TRUE)
+lambda<-0.1
+nb_src<-n_sources
+nb_dst<-n_dest
+idx_src<-Source.vec
+idx_dst<-Destination.vec
+
+state<-function(transmatrix, initstate,Horizon){.  #The state transition function for each source and destination
+  State<-array(0,c(1,Horizon))
+  State[,1]<-initstate
+  for(n in 2:Horizon){
+      State[,n]<-sample(c(1,2),size=1,prob=transmatrix[State[(n-1)],])
+  }
+  return(State)}
+
+rand.1<-function(state,n,l1,l2){ #Draws an exponential variable for the new traffic distribution
+  if (state[n] > 1) {
+    return(rexp(1, rate=l1) )
+  }
+  else {
+    return(rexp(1, rate=l2) )
+  }}
+  
+rate<-function(state,Horizon,I,l1,l2){     #Detemines the traffic proportion allowed to sources and destinations
+  Rate<-array(0,c(I,Horizon))    
+  Rand<-array(0,c(I))           
+  for(i in 1:I){
+      Rand[i]<-rand.1(state,1,l1,l2)}
+  sum<-sum(Rand)
+  for(i in 1:I){
+      Rate[i,1]<-Rand[i]/sum}
+  for(n in 1:(Horizon-1)){
+      if (state[n]!=state[n+1]){     #A state change indicates a new traffic load distribution
+              n.change<-sample(c(1:I))[1]         #The number of nodes with a traffic load proporton change
+              index<-sample(c(1:I))[1:n.change]    #The indexes of the nodes with a traffic load proporton change
+              for(i in index){
+                  Rand[i]<-rand.1(state,n+1,l1,l2)}
+              
+              for(i in index){       #Normalization step
+                  Rate[i,(n+1)]<-(Rand[i]/sum(Rand[index]))*(1-sum(Rate[-index,n]))}
+              for(i in c(1:I)[-index]){
+                 Rate[i,(n+1)]<- Rate[i,n]}   #The traffic load of the rest of the nodes remains the same
+      } 
+    else {Rate[,n+1]<-Rate[,n]}}     #The traffic proportion remains the same if the state doesn't change
+  return(Rate)}
+
+jumps<-function(state,Horizon){   #Determines the instant of traffic load change
+  sauts<-c()
+  for(n in 1:(Horizon-1)){
+  if (state[n]!=state[n+1]){
+    sauts<-append(sauts, n)
+  }}
+  return(sauts)}
+
+stateS1<-state(tmS1, 2,Horizon)
+stateD1<-state(tmD1, 1,Horizon)
+#n.change<-3
+RateS<-rate(stateS1,Horizon,n_sources, 1/3,3/4)
+jumpS<-jumps(stateS1,Horizon)
+
+RateD<-rate(stateD1,Horizon,n_dest, 1/3,3/4)
+jumpD<-jumps(stateD1,Horizon)
+
+###### Generating the traffic matrix between each source and destination for the different timeslots
+Traffic.matrix<-array(0,c(n_sources,n_dest,Horizon))
+for(n in 1:Horizon){ 
+  for(i in 1:n_sources){ 
+    for(j in 1:n_dest){
+      Traffic.matrix[i,j,n]<-RateS[i,n]*RateD[j,n]*Volume(n)  #The traffic between a source and a destination
+    }}}                                                       #follows a gravity model
+
+
+Traffic.vector<-array(0,c(n_sources*n_dest,Horizon)) #Vectorizing the traffic matrix for each instant
+for(n in 1:Horizon){ 
+        Traffic.vector[,n]<-as.vector(Traffic.matrix[,,n]) } #concatenating the vectors
+
+###### Plotting the traffic series between each source and destination in time
+matplot(t(Traffic.vector),type="l",xlab="Time",ylab="Traffic per source/destination")
+
+###### Calculating the delays per link
+mu=1
+C=300
+delay<-function(mu,C,traffic_per_link){
+  return((1/mu)*1/(1-traffic_per_link/C))
+}
+traffic.per.link<-array(0,c(2*length(E(g)),Horizon))
+delay.per.link<-array(0,c(2*length(E(g)),Horizon))
+
+for(n in 1:Horizon){
+    
+      traffic.per.link[,n]<-t(Traffic.vector[,n])%*%R
+      for(i in 1:length(traffic.per.link[,n])){
+      delay.per.link[i,n]<-delay(mu,C,traffic.per.link[i,n])
+ 
+}}
+
+###### Calculating the delays per path
+DR=array(0,c(length(Source.vec)*length(Destination.vec),2*length(E(g)),Horizon))
+LR=array(0,c(length(Source.vec)*length(Destination.vec),Horizon))
+for(n in 1:(Horizon)){   
+  #To this end we use the routing matrix in order to keep only the link delays involved in each path, given by DR
+    matrix<-delay.per.link[,n]
+  
+    for(k in 1:(length(Source.vec)*length(Destination.vec)-1)){ 
+      matrix<-rbind(matrix,delay.per.link[,n])
+    }
+    DR[,,n]<-R*matrix
+}  
+for(n in 1:(Horizon)){
+  for(i in 1:(length(Source.vec)*length(Destination.vec))){
+    #Then we sum the element of each line in DR in order to get the total delay of the path
+    LR[i,n]<-sum(DR[i,,n])
+  }
+} 
+
+###### Plotting the delays per path
+matplot(t(LR),type="l",xlab="Time",ylab="Source destination delay")
+
+
+
+
+
+
